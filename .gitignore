@@ -1,0 +1,11 @@
+/artifacts/
+/release/data/
+/data/
+*.user
+/release/*.exe
+/dist/
+/COMPATIBILITY_TEST.md
+/scripts/
+/.vs/
+*.suo
+*.log
