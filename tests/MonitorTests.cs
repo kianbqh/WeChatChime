@@ -43,6 +43,58 @@ class MonitorTestsMain
         Check(engine.Observe(new[]{Row("A",11)},config,time.AddSeconds(9)).Count==1,"same content still alerts on each count increment");
         // A transient source read failure does not call Observe or Reset.
         Check(engine.Observe(new[]{Row("A",12)},config,time.AddSeconds(20)).Count==1,"same source resumes after a read gap");
+        CheckRecoverySchedule(time);
+        CheckConnectionLifecycle(config,time);
         Console.WriteLine("PASS "+count+" monitor checks");
+    }
+
+    static void CheckRecoverySchedule(DateTime time)
+    {
+        var retry=new CompatibilityRetrySchedule();
+        const string first="uia:100:1000:10",other="uia:100:1000:20",restarted="uia:200:2000:10";
+        int firstCalls=0,otherCalls=0,restartedCalls=0;
+        Func<string> firstAttempt=delegate { firstCalls++; return firstCalls==1?"temporary failure":null; };
+        Func<string> otherAttempt=delegate { otherCalls++; return null; };
+        Check(retry.TryEnsure(first,time,true,firstAttempt)=="temporary failure" && firstCalls==1,"first recovery failure is recorded");
+        Check(retry.TryEnsure(other,time,true,otherAttempt)==null && otherCalls==1,"failing candidate does not delay another window");
+        Check(retry.TryEnsure(first,time.AddSeconds(29),true,firstAttempt)=="temporary failure" && firstCalls==1,"failure respects retry interval");
+        Check(retry.TryEnsure(other,time.AddSeconds(4),true,otherAttempt)==null && otherCalls==1,"healthy state checks are rate limited");
+        Check(retry.TryEnsure(other,time.AddSeconds(5),true,otherAttempt)==null && otherCalls==2,"healthy provider is checked again even without UIA failure");
+        Check(retry.TryEnsure(restarted,time.AddSeconds(6),true,delegate { restartedCalls++; return null; })==null && restartedCalls==1,"new process identity retries immediately despite old failure");
+        Check(retry.TryEnsure(first,time.AddSeconds(30),true,firstAttempt)==null && firstCalls==2,"failed target can recover automatically");
+        Check(retry.TryEnsure(first,time.AddSeconds(34),true,firstAttempt)==null && firstCalls==2,"recovered target uses healthy check interval");
+        Check(retry.TryEnsure(first,time.AddSeconds(35),true,firstAttempt)==null && firstCalls==3,"recovered target is rechecked after five seconds");
+        Check(retry.TryEnsure(first,time.AddSeconds(70),false,delegate { throw new Exception("disabled adapter must never be called"); })==null,"disabled mode never invokes recovery");
+        retry.Retain(new[]{other});
+        Check(retry.Count==1,"disappeared windows are removed from retry state");
+        Check(retry.TryEnsure(first,time.AddSeconds(36),true,firstAttempt)==null && firstCalls==4,"a window that reappears has no stale retry deadline");
+        retry.Clear();
+        Check(retry.Count==0,"turning compatibility off clears prior errors and retry clocks");
+        Check(retry.TryEnsure(first,time.AddSeconds(37),true,firstAttempt)==null && firstCalls==5,"reenabling can recover immediately");
+        retry.Retain(new string[0]);
+        Check(retry.Count==0,"no windows leaves no retained retry entries");
+    }
+
+    static void CheckConnectionLifecycle(AppSettings config,DateTime time)
+    {
+        var connected=new MonitorSnapshot { Connected=true };
+        var unavailable=new MonitorSnapshot();
+        const string first="uia:100:1000:10",restarted="uia:200:2000:20";
+        using(var monitor=new WeChatMonitor())
+        {
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",4)},first,config,time).Count==0,"first connected source establishes silent baseline");
+            Check(monitor.ObserveSnapshot(unavailable,new[]{Row("A",99)},null,config,time.AddSeconds(3)).Count==0,"failed read cannot update counts or alert");
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",4)},first,config,time.AddSeconds(6)).Count==0,"recovery with unchanged unread does not replay backlog");
+            monitor.ObserveSnapshot(unavailable,new SessionReading[0],null,config,time.AddSeconds(9));
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",5)},first,config,time.AddSeconds(12)).Count==1,"same source alerts once for increase during recovery gap");
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",5)},first,config,time.AddSeconds(15)).Count==0,"recovery snapshot is not repeated");
+            Check(monitor.ObserveSnapshot(connected,new SessionReading[0],first,config,time.AddSeconds(18)).Count==0,"readable empty list remains a connected observation");
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",5)},first,config,time.AddSeconds(21)).Count==0,"rows returning from an empty list keep their prior baseline");
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",6)},first,config,time.AddSeconds(24)).Count==1,"new unread after an empty list is still detected");
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",10)},restarted,config,time.AddSeconds(27)).Count==0,"a restarted process does not replay its existing unread messages");
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",11)},restarted,config,time.AddSeconds(30)).Count==1,"a restarted process detects subsequent arrivals");
+            Check(monitor.ObserveSnapshot(unavailable,new SessionReading[0],"absent",config,time.AddSeconds(33)).Count==0,"confirmed absence clears source without alerting");
+            Check(monitor.ObserveSnapshot(connected,new[]{Row("A",12)},restarted,config,time.AddSeconds(36)).Count==0,"return after confirmed absence establishes a fresh baseline");
+        }
     }
 }

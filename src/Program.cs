@@ -10,7 +10,7 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("本地重点联系人提示音")]
 [assembly: AssemblyCompany("Local tools")]
 [assembly: AssemblyProduct("轻响")]
-[assembly: AssemblyVersion("0.2.0.0")]
+[assembly: AssemblyVersion("0.3.0.0")]
 
 namespace WeChatChime
 {

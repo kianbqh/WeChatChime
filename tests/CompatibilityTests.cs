@@ -13,6 +13,7 @@ class CompatibilityTestsMain
     }
     static void Main()
     {
+        CheckFlagRecovery();
         Check(CompatibilityAccess.LocationsInModule(CompatibilityAccess.TargetRva+1),"last byte inside module");
         Check(!CompatibilityAccess.LocationsInModule(CompatibilityAccess.TargetRva),"target at module end rejected");
         Check(!CompatibilityAccess.LocationsInModule(0),"empty module rejected");
@@ -51,6 +52,76 @@ class CompatibilityTestsMain
             Check(access.EnsureEnabled(IntPtr.Zero)!=null,"disposed adapter rejects enable");
         }
         Console.WriteLine("PASS "+count+" compatibility guard checks (no WeChat access)");
+    }
+    static void Throws(Action action,string message)
+    {
+        bool failed=false;
+        try { action(); } catch(InvalidOperationException) { failed=true; }
+        Check(failed,message);
+    }
+    sealed class FlagDevice
+    {
+        public byte Value;
+        public int Validations,Reads,Writes;
+        public bool RejectValidation,FailAfterWrite,IgnoreWrite;
+        public void Validate() { Validations++; if(RejectValidation) throw new InvalidOperationException("identity or runtime mismatch"); }
+        public byte Read() { Reads++; return Value; }
+        public void Write(byte value) {
+            Writes++;
+            if(!IgnoreWrite) Value=value;
+            if(FailAfterWrite) throw new InvalidOperationException("write verification interrupted");
+        }
+    }
+    static void CheckFlagRecovery()
+    {
+        var device=new FlagDevice(); var lease=new CompatibilityFlagLease();
+        Action enable=delegate { lease.EnsureEnabled(device.Validate,device.Read,device.Write); };
+        Action restore=delegate { lease.Restore(device.Validate,device.Read,device.Write); };
+        enable();
+        Check(device.Value==1 && lease.IsOwned,"initial zero acquired");
+        enable(); Check(device.Writes==1 && device.Validations==2,"healthy flag revalidated without repeated writes");
+        for(int i=0;i<3;i++) {
+            device.Value=0; enable();
+            Check(device.Value==1 && lease.IsOwned,"known reset automatically restored "+i);
+        }
+        restore(); Check(device.Value==0 && !lease.IsOwned,"exit after repeated recovery restores zero");
+        int writes=device.Writes; restore(); Check(device.Writes==writes,"release idempotent");
+
+        device.Value=1; enable();
+        Check(!lease.IsOwned,"pre-existing accessibility not owned");
+        restore(); Check(device.Value==1 && device.Writes==writes,"external enabled state untouched on release");
+        enable(); device.Value=0; enable();
+        Check(lease.IsOwned && device.Value==1,"external state later reset is newly acquired");
+        restore(); Check(device.Value==0,"newly acquired state restores its immediate original zero");
+
+        device.Value=2; writes=device.Writes;
+        Throws(enable,"unexpected state refuses enable");
+        Check(device.Value==2 && device.Writes==writes && !lease.IsOwned,"unexpected byte preserved");
+        device.Value=0; device.RejectValidation=true; int reads=device.Reads;
+        Throws(enable,"identity or runtime mismatch refuses access");
+        Check(device.Reads==reads && device.Writes==writes,"guard failure precedes all memory access");
+        device.RejectValidation=false; device.FailAfterWrite=true;
+        Throws(enable,"partial successful write reports failure");
+        Check(device.Value==1 && lease.IsOwned,"partial write retains rollback ownership");
+        device.FailAfterWrite=false; restore();
+        Check(device.Value==0 && !lease.IsOwned,"partial write rolled back");
+
+        device.IgnoreWrite=true; Throws(enable,"failed enable readback rejected");
+        Check(lease.IsOwned,"unverified write still retains rollback ownership");
+        device.IgnoreWrite=false; restore(); Check(!lease.IsOwned,"already reset zero releases ownership");
+        enable(); device.Value=2; writes=device.Writes;
+        Throws(restore,"unexpected external mutation refuses restore");
+        Check(device.Value==2 && device.Writes==writes && lease.IsOwned,"failed restore retains retry without overwrite");
+        device.Value=1; device.RejectValidation=true; reads=device.Reads;
+        Throws(restore,"restore revalidates retained target");
+        Check(device.Reads==reads && device.Writes==writes,"restore guard failure precedes memory access");
+        device.RejectValidation=false; device.IgnoreWrite=true;
+        Throws(restore,"failed restore readback rejected");
+        Check(lease.IsOwned,"restore readback failure retains retry ownership");
+        device.IgnoreWrite=false; restore();
+        Check(device.Value==0 && !lease.IsOwned,"restore retry succeeds");
+        enable(); lease.Clear(); device.Value=1; restore();
+        Check(!lease.IsOwned && device.Value==1,"exited process cleanup does not restore into a new process");
     }
     static bool Region(uint flags)
     {

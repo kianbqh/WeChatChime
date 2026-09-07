@@ -252,7 +252,11 @@ namespace WeChatChime
 
     public sealed class SoundService : IDisposable
     {
-        public static readonly string[] BuiltInSounds = { "builtin:soft", "builtin:bell", "builtin:wood" };
+        public static readonly string[] BuiltInSounds =
+        {
+            "builtin:soft", "builtin:bell", "builtin:wood", "builtin:doorbell",
+            "builtin:crystal", "builtin:radar", "builtin:urgent", "builtin:melody"
+        };
         public event EventHandler<SoundPlaybackErrorEventArgs> PlaybackFailed;
         private readonly object gate = new object();
         private readonly Queue<Action> commands = new Queue<Action>();
@@ -275,13 +279,24 @@ namespace WeChatChime
                 case "builtin:soft": return "轻柔双音";
                 case "builtin:bell": return "清脆铃音";
                 case "builtin:wood": return "轻敲木音";
+                case "builtin:doorbell": return "叮咚门铃";
+                case "builtin:crystal": return "水晶三连";
+                case "builtin:radar": return "雷达呼叫";
+                case "builtin:urgent": return "醒目连响";
+                case "builtin:melody": return "上行旋律";
                 default: return String.IsNullOrWhiteSpace(sound) ? "未选择提示音" : Path.GetFileName(sound);
             }
         }
 
         internal static bool IsBuiltIn(string sound)
         {
-            return sound == "builtin:soft" || sound == "builtin:bell" || sound == "builtin:wood";
+            switch (sound)
+            {
+                case "builtin:soft": case "builtin:bell": case "builtin:wood":
+                case "builtin:doorbell": case "builtin:crystal": case "builtin:radar":
+                case "builtin:urgent": case "builtin:melody": return true;
+                default: return false;
+            }
         }
 
         public void Play(string sound)
@@ -453,7 +468,18 @@ namespace WeChatChime
         {
             if (!IsBuiltIn(sound)) throw new ArgumentException("未知的内置提示音。", "sound");
             const int rate = 22050;
-            double duration = sound == "builtin:bell" ? 0.72 : (sound == "builtin:wood" ? 0.22 : 0.48);
+            double duration;
+            switch (sound)
+            {
+                case "builtin:soft": duration = 1.20; break;
+                case "builtin:bell": duration = 1.55; break;
+                case "builtin:wood": duration = 1.10; break;
+                case "builtin:doorbell": duration = 1.90; break;
+                case "builtin:crystal": duration = 1.85; break;
+                case "builtin:radar": duration = 2.40; break;
+                case "builtin:urgent": duration = 2.80; break;
+                default: duration = 2.40; break;
+            }
             int count = (int)(rate * duration);
             using (MemoryStream stream = new MemoryStream(44 + count * 2))
             using (BinaryWriter writer = new BinaryWriter(stream))
@@ -466,32 +492,80 @@ namespace WeChatChime
                 for (int i = 0; i < count; i++)
                 {
                     double time = (double)i / rate;
-                    double sample;
-                    if (sound == "builtin:soft")
-                    {
-                        sample = SoftNote(time, 659.255, 0.21) + SoftNote(time - 0.18, 880.0, 0.28);
-                    }
-                    else if (sound == "builtin:bell")
-                    {
-                        double envelope = Math.Min(time / 0.007, 1.0) * Math.Exp(-time * 7.5) * Math.Min((duration - time) / 0.035, 1.0);
-                        sample = 0.18 * envelope * (Math.Sin(2 * Math.PI * 1046.5 * time) + 0.22 * Math.Sin(2 * Math.PI * 2096 * time));
-                    }
-                    else
-                    {
-                        double envelope = Math.Min(time / 0.003, 1.0) * Math.Exp(-time * 27) * Math.Min((duration - time) / 0.02, 1.0);
-                        sample = 0.23 * envelope * (Math.Sin(2 * Math.PI * (620 * time - 260 * time * time)) + 0.12 * Math.Sin(2 * Math.PI * 1580 * time));
-                    }
-                    writer.Write((short)(Math.Max(-0.30, Math.Min(0.30, sample)) * Int16.MaxValue));
+                    double sample = BuiltInSample(sound, time);
+                    // Notes are mixed below full scale; this is only a final PCM conversion guard.
+                    writer.Write((short)(Math.Max(-1.0, Math.Min(1.0, sample)) * Int16.MaxValue));
                 }
                 return stream.ToArray();
             }
         }
 
-        private static double SoftNote(double time, double frequency, double duration)
+        private static double BuiltInSample(string sound, double time)
+        {
+            switch (sound)
+            {
+                case "builtin:soft":
+                    return SoftNote(time, 659.255, 0.65, 0.42) + SoftNote(time - 0.48, 880.0, 0.70, 0.42);
+                case "builtin:bell":
+                    return BellNote(time, 1046.5, 1.48, 0.78);
+                case "builtin:wood":
+                    return WoodNote(time, 620, 0.29) + WoodNote(time - 0.34, 720, 0.29) + WoodNote(time - 0.70, 620, 0.32);
+                case "builtin:doorbell":
+                    return BellNote(time, 830.61, 1.12, 0.80) + BellNote(time - 0.72, 622.25, 1.10, 0.78);
+                case "builtin:crystal":
+                    return BellNote(time, 880.0, 0.92, 0.68) + BellNote(time - 0.38, 1108.73, 0.96, 0.68)
+                        + BellNote(time - 0.80, 1318.51, 0.96, 0.68);
+                case "builtin:radar":
+                    double pulse = time % 0.80;
+                    if (pulse >= 0.56) return 0;
+                    double envelope = Math.Sin(Math.PI * pulse / 0.56);
+                    double phase = 2 * Math.PI * (650 * pulse + 450 * pulse * pulse);
+                    return 0.82 * envelope * envelope * (Math.Sin(phase) + 0.16 * Math.Sin(2 * phase)) / 1.16;
+                case "builtin:urgent":
+                    double group = time % 0.90;
+                    if (time >= 2.70) return 0;
+                    return ClearNote(group, 1046.5, 0.28, 0.84) + ClearNote(group - 0.36, 1318.51, 0.28, 0.84);
+                default:
+                    return ClearNote(time, 523.25, 0.45, 0.62) + ClearNote(time - 0.50, 659.255, 0.45, 0.62)
+                        + ClearNote(time - 1.0, 783.99, 0.45, 0.62) + ClearNote(time - 1.50, 1046.5, 0.82, 0.68);
+            }
+        }
+
+        private static double SoftNote(double time, double frequency, double duration, double level)
         {
             if (time < 0 || time >= duration) return 0;
             double envelope = Math.Sin(Math.PI * time / duration);
-            return 0.16 * envelope * envelope * Math.Sin(2 * Math.PI * frequency * time);
+            return level * envelope * envelope * Math.Sin(2 * Math.PI * frequency * time);
+        }
+
+        private static double BellNote(double time, double frequency, double duration, double level)
+        {
+            if (time < 0 || time >= duration) return 0;
+            double envelope = Fade(time, duration, 0.008, 0.12) * Math.Exp(-2.5 * time / duration);
+            double phase = 2 * Math.PI * frequency * time;
+            return level * envelope * (Math.Sin(phase) + 0.26 * Math.Sin(phase * 2.003) + 0.10 * Math.Sin(phase * 3.99)) / 1.36;
+        }
+
+        private static double WoodNote(double time, double frequency, double duration)
+        {
+            if (time < 0 || time >= duration) return 0;
+            double envelope = Fade(time, duration, 0.004, 0.04) * Math.Exp(-14 * time);
+            double phase = 2 * Math.PI * (frequency * time - 140 * time * time);
+            return 0.82 * envelope * (Math.Sin(phase) + 0.30 * Math.Sin(2 * Math.PI * frequency * 2.67 * time)) / 1.30;
+        }
+
+        private static double ClearNote(double time, double frequency, double duration, double level)
+        {
+            if (time < 0 || time >= duration) return 0;
+            double phase = 2 * Math.PI * frequency * time;
+            return level * Fade(time, duration, 0.014, 0.06) * (Math.Sin(phase) + 0.20 * Math.Sin(2 * phase)) / 1.20;
+        }
+
+        private static double Fade(double time, double duration, double attack, double release)
+        {
+            // A raised-cosine edge avoids clicks, including where repeated notes meet silence.
+            double edge = Math.Min(1.0, Math.Min(time / attack, (duration - time) / release));
+            return 0.5 - 0.5 * Math.Cos(Math.PI * edge);
         }
 
         private sealed class PumpWindow : NativeWindow

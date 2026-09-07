@@ -381,7 +381,7 @@ namespace WeChatChime
             _tips.SetToolTip(_preview, "试听当前提示音 (F5)");
             actions.Controls.Add(_preview, 1, 0);
             card.Controls.Add(actions, 0, 5);
-            _editorHelp.Text = "支持 WAV、MP3、M4A、WMA，最大 20 MB\r\n建议使用简短、容易辨认的声音。";
+            _editorHelp.Text = "需要明显提醒？试试“醒目连响”（2.8 秒）。\r\n可导入 WAV、MP3、M4A、WMA，最大 20 MB。";
             _editorHelp.ForeColor = Muted;
             _editorHelp.Font = new Font("Microsoft YaHei UI", 8F);
             _editorHelp.Dock = DockStyle.Fill;

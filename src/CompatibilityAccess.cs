@@ -7,6 +7,42 @@ using Microsoft.Win32.SafeHandles;
 
 namespace WeChatChime
 {
+    // The same lifecycle is used with native I/O and with deterministic fault tests.
+    // Every enable/restore validates the retained process before touching its flag.
+    internal sealed class CompatibilityFlagLease
+    {
+        bool owned;
+        public bool IsOwned { get { return owned; } }
+
+        public void EnsureEnabled(Action validate, Func<byte> read, Action<byte> write)
+        {
+            validate();
+            byte current=read();
+            if(current>1) throw new InvalidOperationException("微信辅助访问状态异常，已停止启用。" );
+            if(current==0)
+            {
+                // The value immediately before our first write is always 0. This
+                // also covers a previously external 1 that WeChat later resets.
+                owned=true;
+                write(1);
+                if(read()!=1) throw new InvalidOperationException("微信兼容状态回读校验失败。" );
+            }
+        }
+
+        public void Restore(Action validate, Func<byte> read, Action<byte> write)
+        {
+            if(!owned) return;
+            validate();
+            byte current=read();
+            if(current>1) throw new InvalidOperationException("微信状态被其他程序修改，未覆盖该状态。" );
+            if(current!=0) write(0);
+            if(read()!=0) throw new InvalidOperationException("微信原始状态还原校验失败。" );
+            owned=false;
+        }
+
+        public void Clear() { owned=false; }
+    }
+
     // Explicit opt-in adapter for one verified Weixin build. No scanning, injection,
     // executable writes, on-disk modification, or automatic version fallback.
     public sealed class CompatibilityAccess : IDisposable
@@ -19,12 +55,12 @@ namespace WeChatChime
         ProcessHandle process;
         int processId, moduleSize;
         long creationTime, moduleBase;
-        byte original;
-        bool changed, enabled, disposed;
+        readonly CompatibilityFlagLease flag = new CompatibilityFlagLease();
+        bool enabled, disposed;
         string restoreError;
 
         public string LastRestoreError { get { lock(gate) return restoreError; } }
-        public bool IsOwned { get { lock(gate) return changed; } }
+        public bool IsOwned { get { lock(gate) return flag.IsOwned; } }
         public bool IsEnabled { get { lock(gate) return enabled; } }
 
         // The caller must require the user's EnableCompatibility setting before calling.
@@ -46,31 +82,9 @@ namespace WeChatChime
                             string failure = ReleaseCore();
                             if(failure != null) return failure;
                         }
-                        else
-                        {
-                            ValidateIdentity();
-                            ValidateRuntime();
-                            if(Read(moduleBase+TargetRva,1)[0] != 1)
-                            {
-                                enabled=false;
-                                return "微信兼容状态已变化，请关闭后重新启用兼容模式。";
-                            }
-                            enabled=true;
-                            return null;
-                        }
                     }
-                    Acquire(window,windowPid);
-                    ValidateIdentity();
-                    ValidateRuntime();
-                    original=Read(moduleBase+TargetRva,1)[0];
-                    if(original>1) throw new InvalidOperationException("微信辅助访问状态异常，已停止启用。" );
-                    if(original==0)
-                    {
-                        // Mark ownership BEFORE attempting the write: failed verification
-                        // must still cause rollback of a possibly completed single-byte write.
-                        changed=true;
-                        WriteByte(1);
-                    }
+                    if(process==null) Acquire(window,windowPid);
+                    flag.EnsureEnabled(ValidateAccess,ReadFlag,WriteByte);
                     enabled=true;
                     restoreError=null;
                     return null;
@@ -84,6 +98,9 @@ namespace WeChatChime
             }
         }
 
+        void ValidateAccess() { ValidateIdentity(); ValidateRuntime(); }
+        byte ReadFlag() { return Read(moduleBase+TargetRva,1)[0]; }
+
         void Acquire(IntPtr window,uint windowPid)
         {
             if(IntPtr.Size!=8) throw new InvalidOperationException("兼容模式需要 64 位程序。" );
@@ -95,7 +112,11 @@ namespace WeChatChime
             {
                 foreach(var candidate in candidates)
                 {
-                    foreach(ProcessModule module in candidate.Modules)
+                    ProcessModuleCollection modules;
+                    try { modules=candidate.Modules; }
+                    catch(InvalidOperationException) { if(candidate.HasExited) continue; throw; }
+                    catch(System.ComponentModel.Win32Exception) { if(candidate.HasExited) continue; throw; }
+                    foreach(ProcessModule module in modules)
                     {
                         if(!String.Equals(module.ModuleName,"Weixin.dll",StringComparison.OrdinalIgnoreCase)) continue;
                         if(foundId!=0) throw new InvalidOperationException("检测到多个微信主进程，兼容模式暂不支持。" );
@@ -219,17 +240,7 @@ namespace WeChatChime
             if(process==null || process.IsInvalid) { ClearHandle(); restoreError=null; return null; }
             try
             {
-                if(changed && IsRunning())
-                {
-                    ValidateIdentity();
-                    ValidateRuntime();
-                    byte current=Read(moduleBase+TargetRva,1)[0];
-                    if(current!=original && current!=1)
-                        throw new InvalidOperationException("微信状态被其他程序修改，未覆盖该状态。" );
-                    if(current!=original) WriteByte(original);
-                    if(Read(moduleBase+TargetRva,1)[0]!=original)
-                        throw new InvalidOperationException("微信原始状态还原校验失败。" );
-                }
+                if(flag.IsOwned && IsRunning()) flag.Restore(ValidateAccess,ReadFlag,WriteByte);
                 ClearHandle(); restoreError=null; return null;
             }
             catch(Exception ex)
@@ -250,7 +261,7 @@ namespace WeChatChime
         void ClearHandle()
         {
             if(process!=null) process.Dispose();
-            process=null; processId=0; moduleSize=0; moduleBase=0; creationTime=0; changed=false; enabled=false;
+            process=null; processId=0; moduleSize=0; moduleBase=0; creationTime=0; flag.Clear(); enabled=false;
         }
 
         public void Dispose()

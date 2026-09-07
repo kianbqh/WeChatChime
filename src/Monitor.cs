@@ -88,6 +88,30 @@ namespace WeChatChime
         }
     }
 
+    // Each window/process identity has its own retry clock. A stale or unsupported
+    // window must not postpone recovery of another window or a restarted WeChat.
+    internal sealed class CompatibilityRetrySchedule
+    {
+        sealed class Attempt { internal DateTime Next; internal string Error; }
+        readonly Dictionary<string,Attempt> attempts = new Dictionary<string,Attempt>(StringComparer.Ordinal);
+        internal int Count { get { return attempts.Count; } }
+        internal void Clear() { attempts.Clear(); }
+        internal void Retain(IEnumerable<string> targets)
+        {
+            var live = new HashSet<string>(targets,StringComparer.Ordinal);
+            foreach(string key in new List<string>(attempts.Keys)) if(!live.Contains(key)) attempts.Remove(key);
+        }
+        internal string TryEnsure(string target,DateTime utcNow,bool allowed,Func<string> ensure)
+        {
+            if(!allowed) return null;
+            Attempt attempt;
+            if(attempts.TryGetValue(target,out attempt) && utcNow<attempt.Next) return attempt.Error;
+            string error=ensure();
+            attempts[target]=new Attempt { Next=utcNow.AddSeconds(error==null?5:30), Error=error };
+            return error;
+        }
+    }
+
     public sealed class WeChatMonitor : IDisposable
     {
         public event Action<MonitorSnapshot> SnapshotChanged;
@@ -97,6 +121,7 @@ namespace WeChatChime
         readonly AutoResetEvent wake = new AutoResetEvent(false);
         readonly AlertEngine engine = new AlertEngine();
         readonly CompatibilityAccess compatibility = new CompatibilityAccess();
+        readonly CompatibilityRetrySchedule compatibilityRetries = new CompatibilityRetrySchedule();
         readonly object compatibilityGate = new object();
         AppSettings settings = new AppSettings();
         volatile bool disposed;
@@ -104,13 +129,12 @@ namespace WeChatChime
         System.Threading.Timer watchdog;
         long scanStarted;
         string lastSource;
-        DateTime nextCompatibilityAttempt;
-        string compatibilityError;
         public string LastRestoreError { get { return compatibility.LastRestoreError; } }
         public void Configure(AppSettings value) {
             lock(gate) { settings=value.Clone(); }
             if(!value.CompatibilityMode) lock(compatibilityGate) {
-                string failure=compatibility.Release(); nextCompatibilityAttempt=DateTime.MinValue;
+                compatibilityRetries.Clear();
+                string failure=compatibility.Release();
                 if(failure!=null) { var fault=Fault; if(fault!=null) fault(failure); }
             }
             wake.Set();
@@ -144,11 +168,10 @@ namespace WeChatChime
                     Interlocked.Exchange(ref scanStarted,DateTime.UtcNow.Ticks);
                     var snapshot = Read(config,out rows, out source);
                     Interlocked.Exchange(ref scanStarted,0);
-                    if (source != null && source != lastSource) { engine.Reset(); lastSource = source; }
+                    lock(gate) config=settings.Clone();
+                    var alerts = ObserveSnapshot(snapshot,rows,source,config,DateTime.UtcNow);
                     if(snapshot.Connected)
                     {
-                        lock(gate) config=settings.Clone();
-                        var alerts = engine.Observe(rows, config, DateTime.UtcNow);
                         var available=new HashSet<string>(snapshot.Contacts,StringComparer.OrdinalIgnoreCase);
                         int missing=0,ambiguousCount=0;
                         foreach(var rule in config.Contacts) if(rule.Enabled) {
@@ -160,7 +183,7 @@ namespace WeChatChime
                         if (!config.Enabled) snapshot.Status = "提醒已暂停";
                         foreach(string name in alerts) { var handler=Alert; if(handler!=null && !disposed) handler(name); }
                     }
-                    else { if(source=="absent") { engine.Reset(); lastSource=null; } delay=5000; }
+                    else delay=5000;
                     var update=SnapshotChanged; if(update!=null && !disposed) update(snapshot);
                 }
                 catch(Exception ex)
@@ -172,36 +195,72 @@ namespace WeChatChime
                 if(!disposed) wake.WaitOne(delay);
             }
         }
+        internal List<string> ObserveSnapshot(MonitorSnapshot snapshot,IList<SessionReading> rows,string source,AppSettings config,DateTime utcNow)
+        {
+            if(source=="absent") { engine.Reset(); lastSource=null; return new List<string>(); }
+            // A temporarily unavailable tree keeps the prior unread counts. Once the
+            // same source is readable, only counts that actually increased can alert.
+            if(!snapshot.Connected) return new List<string>();
+            if(source!=null && source!=lastSource) { engine.Reset(); lastSource=source; }
+            return engine.Observe(rows,config,utcNow);
+        }
+        sealed class WindowTarget
+        {
+            internal IntPtr Window;
+            internal string Source;
+        }
         internal MonitorSnapshot Read(AppSettings config,out List<SessionReading> rows, out string source)
         {
             rows = new List<SessionReading>(); source = null;
             var result = new MonitorSnapshot { CheckedAt=DateTime.Now };
             var windows=FindWeChatWindows();
             if(disposed) return result;
-            lock(compatibilityGate) if(!config.CompatibilityMode || windows.Count==0) {
-                compatibilityError=compatibility.Release();
-                nextCompatibilityAttempt=DateTime.MinValue;
-            }
-            if(windows.Count==0) { source="absent"; result.Status="未找到微信窗口"; result.Detail="请打开并登录电脑版微信。微信与本工具需以相同用户权限运行。"; return result; }
+            var targets=new List<WindowTarget>();
+            var targetKeys=new List<string>();
+            string compatibilityError=null,readError=null;
             foreach(var window in windows)
             {
-                var root=AutomationElement.FromHandle(window);
-                if(root==null) continue;
-                var list = FindSessions(root);
-                if(list==null && config.CompatibilityMode && DateTime.UtcNow>=nextCompatibilityAttempt)
+                try
                 {
-                    lock(compatibilityGate) {
-                        bool allowed; lock(gate) allowed=settings.CompatibilityMode;
-                        if(!disposed && allowed) {
-                            compatibilityError=compatibility.EnsureEnabled(window);
-                            nextCompatibilityAttempt=DateTime.UtcNow.AddSeconds(compatibilityError==null?5:30);
-                        }
-                    }
-                    if(compatibilityError==null && !disposed) { root=AutomationElement.FromHandle(window); list=FindSessions(root); }
+                    uint pid;
+                    if(Native.GetWindowThreadProcessId(window,out pid)==0 || pid==0) continue;
+                    string key;
+                    using(var process=Process.GetProcessById((int)pid)) key="uia:"+pid+":"+process.StartTime.ToUniversalTime().Ticks+":"+window.ToInt64();
+                    targets.Add(new WindowTarget { Window=window,Source=key }); targetKeys.Add(key);
                 }
-                if(list==null) continue;
-                var cache=new CacheRequest();
+                catch(ArgumentException) { } // Window/process disappeared during enumeration.
+                catch(InvalidOperationException) { }
+                catch(System.ComponentModel.Win32Exception) { readError="无法读取微信进程信息，请保持相同运行权限。"; }
+            }
+            lock(compatibilityGate) {
+                bool allowed; lock(gate) allowed=config.CompatibilityMode && settings.CompatibilityMode;
+                if(!allowed || windows.Count==0) {
+                    compatibilityError=compatibility.Release();
+                    compatibilityRetries.Clear();
+                }
+                else compatibilityRetries.Retain(targetKeys);
+            }
+            if(windows.Count==0) { source="absent"; result.Status="未找到微信窗口"; result.Detail="请打开并登录电脑版微信。微信与本工具需以相同用户权限运行。"; return result; }
+            foreach(var target in targets)
+            {
+                var window=target.Window;
+                // Check before touching UIA: a disabled provider can leave a stale
+                // list, an empty list, or throw while finding the old tree.
+                lock(compatibilityGate)
                 {
+                    bool allowed; lock(gate) allowed=config.CompatibilityMode && settings.CompatibilityMode;
+                    string error=compatibilityRetries.TryEnsure(target.Source,DateTime.UtcNow,!disposed && allowed,
+                        delegate { return compatibility.EnsureEnabled(window); });
+                    if(compatibilityError==null) compatibilityError=error;
+                }
+                if(disposed) return result;
+                try
+                {
+                    var root=AutomationElement.FromHandle(window);
+                    var list=FindSessions(root);
+                    if(list==null) continue;
+                    var candidateRows=new List<SessionReading>();
+                    var cache=new CacheRequest();
                     cache.Add(AutomationElement.NameProperty); cache.Add(AutomationElement.AutomationIdProperty); cache.Add(AutomationElement.ClassNameProperty);
                     cache.TreeScope=TreeScope.Element;
                     cache.AutomationElementMode=AutomationElementMode.None;
@@ -212,25 +271,34 @@ namespace WeChatChime
                         {
                             var c=items[i].Cached;
                             var row=SessionParser.Parse(c.AutomationId,c.ClassName,c.Name);
-                            if(row!=null) rows.Add(row);
+                            if(row!=null) candidateRows.Add(row);
                         }
+                        // An actual empty session list is readable; nonempty rows
+                        // in an unknown format should not establish a false baseline.
+                        if(items.Count>0 && candidateRows.Count==0) { readError="微信会话列表暂不可识别，正在重新检测。"; continue; }
                     }
+                    rows=candidateRows; source=target.Source;
+                    result.Minimized=Native.IsIconic(window);
+                    result.CompatibilityActive=compatibility.IsEnabled;
+                    result.Connected=true; result.Status=result.Minimized?"微信已最小化 · 正在监听":"正在监听微信消息";
+                    result.Detail=rows.Count==0?"已连接微信，会话列表当前为空；新会话出现后会自动继续监听。":"请先置顶重点联系人。按未读数增加提醒；首次连接不补响旧消息。";
+                    var names=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach(var row in rows) if(names.Add(row.Name)) result.Contacts.Add(row.Name);
+                    result.Contacts.Sort(StringComparer.CurrentCulture);
+                    result.SessionCount=rows.Count;
+                    return result;
                 }
-                if(rows.Count==0) continue;
-                uint pid; Native.GetWindowThreadProcessId(window,out pid);
-                using(var process=Process.GetProcessById((int)pid)) source="uia:"+pid+":"+process.StartTime.ToUniversalTime().Ticks+":"+window.ToInt64();
-                result.Minimized=Native.IsIconic(window);
-                result.CompatibilityActive=compatibility.IsEnabled;
-                result.Connected=true; result.Status=result.Minimized?"微信已最小化 · 正在监听":"正在监听微信消息";
-                result.Detail="请先置顶重点联系人。按未读数增加提醒；首次连接不补响旧消息。";
-                var names=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach(var row in rows) if(names.Add(row.Name)) result.Contacts.Add(row.Name);
-                result.Contacts.Sort(StringComparer.CurrentCulture);
-                result.SessionCount=rows.Count;
-                return result;
+                catch(ElementNotAvailableException) { readError="微信会话正在更新，稍后自动重试。"; }
+                catch(InvalidOperationException) { readError="微信会话暂未响应读取，稍后自动重试。"; }
+                catch(COMException) { readError="微信会话暂未响应读取，稍后自动重试。"; }
             }
             result.Status="当前微信未开放消息读取";
-            result.Detail=compatibilityError ?? (config.CompatibilityMode?"兼容模式已启用，但当前会话不可读取。请确认微信已登录并停留在会话页。":"请启用“支持微信最小化（兼容模式）”。仅支持校验通过的微信版本。");
+            bool modeEnabled;
+            lock(compatibilityGate) {
+                lock(gate) modeEnabled=settings.CompatibilityMode;
+                if(!modeEnabled) compatibilityError=compatibility.LastRestoreError;
+            }
+            result.Detail=compatibilityError ?? readError ?? (modeEnabled?"正在自动恢复微信读取，请确认微信已登录并停留在会话页。":"请启用“支持微信最小化（兼容模式）”。仅支持校验通过的微信版本。");
             return result;
         }
         static AutomationElement FindSessions(AutomationElement root)
@@ -262,7 +330,7 @@ namespace WeChatChime
         }
         public void Dispose() {
             disposed=true; if(watchdog!=null) watchdog.Dispose(); wake.Set();
-            lock(compatibilityGate) compatibility.Dispose();
+            lock(compatibilityGate) { compatibilityRetries.Clear(); compatibility.Dispose(); }
         }
     }
     internal static class Native

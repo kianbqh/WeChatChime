@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -25,6 +26,7 @@ namespace WeChatChime.Tests
                 CheckImports(root);
                 CheckPortableSettings(root);
                 CheckWaves();
+                CheckBuiltInSettings(root);
                 CheckPlaybackFailure(root);
                 Console.WriteLine("PASS " + checks + " core checks; fixtures: " + root);
                 return 0;
@@ -199,18 +201,67 @@ namespace WeChatChime.Tests
 
         private static void CheckWaves()
         {
+            HashSet<string> ids = new HashSet<string>(StringComparer.Ordinal);
+            HashSet<string> names = new HashSet<string>(StringComparer.Ordinal);
+            Dictionary<string, double> levels = new Dictionary<string, double>();
+            List<byte[]> rendered = new List<byte[]>();
+            Assert(SoundService.BuiltInSounds.Length >= 8, "at least eight selectable sound styles");
             foreach (string sound in SoundService.BuiltInSounds)
             {
+                Assert(ids.Add(sound) && SoundService.IsBuiltIn(sound), sound + " unique supported identifier");
+                string name = SoundService.DisplayName(sound);
+                Assert(names.Add(name) && !String.IsNullOrWhiteSpace(name) && name != sound, sound + " distinct readable selection label");
                 byte[] wave = SoundService.CreateBuiltInWave(sound);
                 Assert(Encoding.ASCII.GetString(wave, 0, 4) == "RIFF" && Encoding.ASCII.GetString(wave, 8, 8) == "WAVEfmt ", sound + " WAV header");
                 Assert(BitConverter.ToInt32(wave, 4) == wave.Length - 8 && BitConverter.ToInt32(wave, 40) == wave.Length - 44, sound + " WAV lengths");
-                Assert(BitConverter.ToInt16(wave, 20) == 1 && BitConverter.ToInt16(wave, 22) == 1 && BitConverter.ToInt32(wave, 24) == 22050 && BitConverter.ToInt16(wave, 34) == 16, sound + " PCM format");
+                Assert(BitConverter.ToInt16(wave, 20) == 1 && BitConverter.ToInt16(wave, 22) == 1 && BitConverter.ToInt32(wave, 24) == 22050
+                    && BitConverter.ToInt32(wave, 28) == 44100 && BitConverter.ToInt16(wave, 32) == 2 && BitConverter.ToInt16(wave, 34) == 16, sound + " PCM format");
+                int samples = (wave.Length - 44) / 2;
+                double duration = samples / 22050.0;
                 int peak = 0;
-                for (int offset = 44; offset < wave.Length; offset += 2) peak = Math.Max(peak, Math.Abs((int)BitConverter.ToInt16(wave, offset)));
-                Assert(peak > 1000 && peak <= Int16.MaxValue * 0.301, sound + " audible moderate peak");
+                int firstAudible = -1;
+                int lastAudible = -1;
+                int previous = 0;
+                int maximumStep = 0;
+                double sum = 0;
+                for (int sample = 0; sample < samples; sample++)
+                {
+                    int value = BitConverter.ToInt16(wave, 44 + sample * 2);
+                    peak = Math.Max(peak, Math.Abs(value));
+                    maximumStep = Math.Max(maximumStep, Math.Abs(value - previous));
+                    previous = value;
+                    sum += value;
+                    if (Math.Abs(value) > Int16.MaxValue * 0.02)
+                    {
+                        if (firstAudible < 0) firstAudible = sample;
+                        lastAudible = sample;
+                    }
+                }
+                double rms = WaveRms(wave, 0, duration);
+                levels.Add(sound, rms);
+                Assert(duration >= 1.0 && duration <= 3.0, sound + " perceptible duration within three-second resource budget");
+                Assert(peak > Int16.MaxValue * 0.40 && peak < Int16.MaxValue * 0.90, sound + " clear peak with clipping headroom");
+                Assert(rms >= 0.12 && rms <= 0.55, sound + " audible average level with bounded output");
+                Assert((lastAudible - firstAudible) / 22050.0 >= duration * 0.65, sound + " duration contains sound rather than padded silence");
+                Assert(Math.Abs(sum / samples / Int16.MaxValue) < 0.005, sound + " no DC offset");
+                Assert(maximumStep < Int16.MaxValue * 0.42, sound + " no abrupt full-scale transitions");
                 Assert(BitConverter.ToInt16(wave, 44) == 0 && Math.Abs((int)BitConverter.ToInt16(wave, wave.Length - 2)) < 10, sound + " click-free boundaries");
-                Assert(wave.Length < 40000, sound + " lightweight resource");
+                Assert(WaveRms(wave, 0, 0.001) < 0.05 && WaveRms(wave, duration - 0.001, duration) < 0.005, sound + " faded leading and trailing edges");
+                Assert(wave.Length <= 132344, sound + " no more than 130 KiB generated PCM");
+                foreach (byte[] earlier in rendered) Assert(!Equal(earlier, wave), sound + " distinct audio from other styles");
+                rendered.Add(wave);
+                Console.WriteLine("SOUND {0}: {1:F2}s, peak={2:F3}, rms={3:F3}, {4} bytes", sound, duration, peak / (double)Int16.MaxValue, rms, wave.Length);
             }
+            Assert(ids.Contains("builtin:soft") && ids.Contains("builtin:bell") && ids.Contains("builtin:wood"), "all legacy selections remain available");
+            Assert(levels["builtin:urgent"] >= levels["builtin:soft"] * 1.5, "prominent alert is clearly stronger than the gentle option");
+            byte[] urgent = SoundService.CreateBuiltInWave("builtin:urgent");
+            byte[] radar = SoundService.CreateBuiltInWave("builtin:radar");
+            for (int repeat = 0; repeat < 3; repeat++)
+            {
+                Assert(WaveRms(urgent, repeat * 0.90, (repeat + 1) * 0.90) >= 0.25, "prominent alert retains energy in repetition " + (repeat + 1));
+                Assert(WaveRms(radar, repeat * 0.80, (repeat + 1) * 0.80) >= 0.20, "radar retains energy in repetition " + (repeat + 1));
+            }
+            Expect<ArgumentException>(delegate { SoundService.CreateBuiltInWave("builtin:unknown"); }, "unknown synthesized style rejected");
             using (SoundService sound = new SoundService())
             {
                 sound.Stop();
@@ -218,6 +269,32 @@ namespace WeChatChime.Tests
                 sound.Dispose();
                 Expect<ObjectDisposedException>(delegate { sound.Play("builtin:soft"); }, "disposed player rejected");
             }
+        }
+
+        private static double WaveRms(byte[] wave, double startSeconds, double endSeconds)
+        {
+            int start = Math.Max(0, (int)(startSeconds * 22050));
+            int end = Math.Min((wave.Length - 44) / 2, (int)(endSeconds * 22050));
+            double energy = 0;
+            for (int sample = start; sample < end; sample++)
+            {
+                double value = BitConverter.ToInt16(wave, 44 + sample * 2) / (double)Int16.MaxValue;
+                energy += value * value;
+            }
+            return Math.Sqrt(energy / Math.Max(1, end - start));
+        }
+
+        private static void CheckBuiltInSettings(string root)
+        {
+            SettingsStore store = new SettingsStore(Path.Combine(root, "built-in-settings"));
+            AppSettings settings = new AppSettings();
+            foreach (string sound in SoundService.BuiltInSounds)
+                settings.Contacts.Add(new ContactRule { Name = SoundService.DisplayName(sound), Sound = sound });
+            store.Save(settings);
+            AppSettings loaded = store.Load();
+            Assert(loaded.Contacts.Count == settings.Contacts.Count, "all sound selections persist");
+            for (int i = 0; i < loaded.Contacts.Count; i++)
+                Assert(loaded.Contacts[i].Sound == settings.Contacts[i].Sound, "sound choice survives settings roundtrip " + i);
         }
 
         private static bool Equal(byte[] first, byte[] second)
